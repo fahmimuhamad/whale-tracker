@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Whale Intelligence Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div id="app">
+
+    <header class="top-bar">
+      <div class="top-bar-left">
+        <div class="logo">
+          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z"/><path d="M8 12l2 2 4-4"/></svg>
+          <span>WHALE<span class="accent">INTEL</span></span>
+        </div>
+        <div class="market-ticker" id="marketTicker"></div>
+      </div>
+      <div class="top-bar-right">
+        <div class="coin-count" id="coinCount">0 coins</div>
+        <div class="refresh-indicator"><div class="pulse-dot"></div><span>LIVE</span></div>
+        <div class="last-update" id="lastUpdate">--</div>
+        <button class="btn-refresh" id="btnRefresh" title="Force refresh">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0114.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0020.49 15"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <section class="global-stats" id="globalStats">
+      <div class="stat-card">
+        <span class="stat-label">Total Market Cap</span>
+        <span class="stat-value" id="totalMcap">--</span>
+        <span class="stat-change" id="totalMcapChange">--</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">24h Volume</span>
+        <span class="stat-value" id="totalVolume">--</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">BTC Dominance</span>
+        <span class="stat-value" id="btcDominance">--</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Fear & Greed</span>
+        <span class="stat-value" id="fearGreed">--</span>
+        <span class="stat-change" id="fearGreedLabel">--</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Coins w/ Signals</span>
+        <span class="stat-value" id="activeSignals">--</span>
+      </div>
+    </section>
+
+    <main class="dashboard">
+
+      <!-- Search & Filter Bar -->
+      <section class="filter-bar">
+        <div class="search-wrap">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input type="text" id="searchInput" placeholder="Search any coin..." autocomplete="off">
+        </div>
+        <div class="filter-controls">
+          <select id="filterMinPump" title="Min Pump Probability">
+            <option value="0">All Coins</option>
+            <option value="30">Pump > 30%</option>
+            <option value="50">Pump > 50%</option>
+            <option value="65">Pump > 65%</option>
+            <option value="75">Pump > 75%</option>
+          </select>
+          <select id="filterSort" title="Sort by">
+            <option value="pump">Sort: Pump Prob</option>
+            <option value="accumulation">Sort: Accumulation</option>
+            <option value="whale">Sort: Whale Score</option>
+            <option value="smart">Sort: Smart Money</option>
+            <option value="volume">Sort: Volume Change</option>
+            <option value="mcap">Sort: Market Cap</option>
+          </select>
+          <div class="view-toggle">
+            <button class="view-btn active" data-view="grid" title="Grid view">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+            </button>
+            <button class="view-btn" data-view="table" title="Table view">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Asset Cards / Table -->
+      <section class="panel" id="assetPanel">
+        <div class="panel-header">
+          <div>
+            <h2 id="assetPanelTitle">All Assets — Scored in Real-Time</h2>
+            <p class="panel-subtitle" id="assetPanelSubtitle">Whale, Smart Money, Accumulation, and Pump scores are computed algorithmically from live volume, price action, ATH distance, and supply data. "% Supply Traded" estimates the share of total token supply that changed hands in 24h — high values indicate heavy whale activity or turnover.</p>
+          </div>
+          <span class="panel-badge" id="assetCountBadge">--</span>
+        </div>
+        <div class="asset-grid" id="assetGrid"></div>
+        <div class="table-wrap">
+          <table class="data-table asset-table hidden" id="assetTable">
+            <thead>
+              <tr>
+                <th>#</th><th>Asset</th><th>Price</th><th>24h</th><th>7d</th>
+                <th>Vol / MCap</th><th>% Supply Traded</th><th>Whale</th><th>Smart $</th>
+                <th>Accum</th><th>Pump %</th><th>Pressure</th><th>Risk</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div class="pagination" id="pagination"></div>
+      </section>
+
+      <!-- Whale Wallet Activity Feed -->
+      <section class="panel wallet-panel">
+        <div class="panel-header">
+          <div>
+            <h2>Whale Wallet Activity</h2>
+            <p class="panel-subtitle">Live feed of estimated whale transactions derived from on-chain volume data. Wallets are identified by volume concentration analysis. Timestamps in WIB (UTC+7). "% of Supply" shows how much of the token's total supply was moved in that transaction.</p>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="panel-badge green">LIVE FEED</span>
+            <select id="walletFilter" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text-secondary);font-size:0.75rem;font-family:inherit;cursor:pointer;outline:none">
+              <option value="all">All Activity</option>
+              <option value="buy">Buys Only</option>
+              <option value="sell">Sells Only</option>
+              <option value="mega">Mega Whales (>1%)</option>
+            </select>
+          </div>
+        </div>
+        <div class="wallet-feed-header">
+          <span>Wallet</span>
+          <span>Action</span>
+          <span>Asset</span>
+          <span>Amount</span>
+          <span>% of Supply</span>
+          <span>Value (USD)</span>
+          <span>Time (WIB)</span>
+        </div>
+        <div class="wallet-feed" id="walletFeed"></div>
+        <div class="wallet-feed-footer">
+          <span id="walletFeedCount">--</span>
+          <button class="page-btn" id="walletLoadMore">Load More</button>
+        </div>
+      </section>
+
+      <div class="two-col">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Top Accumulation Coins</h2>
+            <span class="panel-badge green">TOP 15 — LIVE</span>
+          </div>
+          <div class="ranked-list" id="accumulationList"></div>
+        </section>
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Early Pump Candidates</h2>
+            <span class="panel-badge orange">TOP 15 — LIVE</span>
+          </div>
+          <div class="ranked-list" id="pumpList"></div>
+        </section>
+      </div>
+
+      <!-- Volume Anomalies -->
+      <section class="panel">
+        <div class="panel-header">
+          <h2>Volume Anomaly Detection</h2>
+          <span class="panel-badge red">SPIKES</span>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="volumeTable">
+            <thead>
+              <tr>
+                <th>Asset</th><th>Price</th><th>24h Change</th>
+                <th>Vol / MCap Ratio</th><th>Anomaly Level</th><th>Whale Score</th><th>Signal</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- Dynamic Market Insights -->
+      <section class="panel insight-panel">
+        <div class="panel-header">
+          <h2>Live Market Insights</h2>
+          <span class="panel-badge purple">AUTO-GENERATED</span>
+        </div>
+        <div class="insights-grid" id="insightsGrid"></div>
+      </section>
+
+    </main>
+
+    <footer>
+      <p>All scores computed algorithmically from live CoinGecko data. Volume, price action, market cap, ATH distance, and supply metrics drive every score. Not financial advice.</p>
+      <p>Auto-refreshes every 90 seconds. Next refresh: <span id="countdown">90</span>s</p>
+    </footer>
+
+  </div>
+
+  <!-- Detail Modal -->
+  <div class="modal-overlay hidden" id="modalOverlay">
+    <div class="modal" id="modal">
+      <button class="modal-close" id="modalClose">&times;</button>
+      <div class="modal-body" id="modalBody"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
