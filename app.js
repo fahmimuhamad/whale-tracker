@@ -938,6 +938,84 @@ function renderWalletFeed() {
     `Showing ${visible.length} of ${txs.length} transactions`;
 }
 
+// ─── Signal Tracking (localStorage) ───
+let trackedSignals = {};
+
+function loadTrackedSignals() {
+  try {
+    const data = localStorage.getItem("whaleIntel_tracked");
+    if (data) trackedSignals = JSON.parse(data);
+  } catch (e) { trackedSignals = {}; }
+}
+
+function saveTrackedSignals() {
+  try { localStorage.setItem("whaleIntel_tracked", JSON.stringify(trackedSignals)); } catch (e) {}
+}
+
+function takeSignal(coinId, entryType) {
+  const sig = tradingSignals.find(s => s.coin.id === coinId);
+  if (!sig) return;
+  const isAgg = entryType === "aggressive";
+  trackedSignals[coinId] = {
+    direction: sig.direction,
+    entryType,
+    entryPrice: isAgg ? sig.entry : sig.consEntry,
+    tp1: isAgg ? sig.tp1 : sig.consTp1,
+    tp2: isAgg ? sig.tp2 : sig.consTp2,
+    sl: isAgg ? sig.sl : sig.consSl,
+    takenAt: Date.now(),
+    status: "active",
+    tp1Hit: false,
+    peakPnl: 0
+  };
+  saveTrackedSignals();
+  renderSignals();
+}
+
+function closeTrackedSignal(coinId) {
+  if (trackedSignals[coinId]) {
+    trackedSignals[coinId].status = "closed";
+    trackedSignals[coinId].closedAt = Date.now();
+    saveTrackedSignals();
+    renderSignals();
+  }
+}
+
+function removeTrackedSignal(coinId) {
+  delete trackedSignals[coinId];
+  saveTrackedSignals();
+  renderSignals();
+}
+
+function updateTrackedSignals() {
+  let changed = false;
+  Object.keys(trackedSignals).forEach(coinId => {
+    const t = trackedSignals[coinId];
+    if (t.status !== "active") return;
+    const sc = scoredCoins.find(s => s.coin.id === coinId);
+    if (!sc) return;
+    const price = sc.coin.current_price;
+    if (!price) return;
+
+    const pnl = t.direction === "LONG"
+      ? ((price - t.entryPrice) / t.entryPrice) * 100
+      : ((t.entryPrice - price) / t.entryPrice) * 100;
+
+    if (pnl > t.peakPnl) t.peakPnl = pnl;
+
+    if (t.direction === "LONG") {
+      if (price <= t.sl) { t.status = "sl"; t.closedAt = Date.now(); changed = true; }
+      else if (price >= t.tp2) { t.status = "tpmax"; t.tp1Hit = true; t.closedAt = Date.now(); changed = true; }
+      else if (price >= t.tp1 && !t.tp1Hit) { t.tp1Hit = true; changed = true; }
+    } else {
+      if (price >= t.sl) { t.status = "sl"; t.closedAt = Date.now(); changed = true; }
+      else if (price <= t.tp2) { t.status = "tpmax"; t.tp1Hit = true; t.closedAt = Date.now(); changed = true; }
+      else if (price <= t.tp1 && !t.tp1Hit) { t.tp1Hit = true; changed = true; }
+    }
+  });
+  if (changed) saveTrackedSignals();
+}
+
 // ─── Trading Signal Engine ───
 let tradingSignals = [];
 
@@ -1021,43 +1099,86 @@ function generateSignals() {
 
     if (!direction) return;
 
-    // ── Compute entry, targets, stop loss ──
-    let entry, tp1, tp2, sl;
+    // ── Compute entries, targets, stop loss ──
     const atr = hi24 - lo24;
     const atrPct = atr / price * 100;
+    const timeframe = atrPct > 8 ? "Scalp / Intraday" : atrPct > 4 ? "Swing (1-3d)" : "Swing (3-7d)";
 
+    // ── AGGRESSIVE: market entry at current price ──
+    let entry = price, tp1, tp2, sl;
     if (direction === "LONG") {
-      entry = price;
       const r1 = Math.max(atrPct * 0.8, 2);
       const r2 = Math.max(atrPct * 1.6, 5);
-      const slPct = Math.max(atrPct * 0.5, 1.5);
+      const slP = Math.max(atrPct * 0.5, 1.5);
       tp1 = price * (1 + r1 / 100);
       tp2 = price * (1 + r2 / 100);
-      sl = price * (1 - slPct / 100);
+      sl = price * (1 - slP / 100);
     } else {
-      entry = price;
       const r1 = Math.max(atrPct * 0.8, 2);
       const r2 = Math.max(atrPct * 1.6, 5);
-      const slPct = Math.max(atrPct * 0.5, 1.5);
+      const slP = Math.max(atrPct * 0.5, 1.5);
       tp1 = price * (1 - r1 / 100);
       tp2 = price * (1 - r2 / 100);
-      sl = price * (1 + slPct / 100);
+      sl = price * (1 + slP / 100);
     }
-
     const risk = Math.abs(entry - sl);
     const reward = Math.abs(tp2 - entry);
     const rr = risk > 0 ? (reward / risk).toFixed(1) : "--";
-
     const tp1Pct = ((tp1 - entry) / entry * 100);
     const tp2Pct = ((tp2 - entry) / entry * 100);
     const slPct = ((sl - entry) / entry * 100);
 
-    const timeframe = atrPct > 8 ? "Scalp / Intraday" : atrPct > 4 ? "Swing (1-3d)" : "Swing (3-7d)";
+    // ── CONSERVATIVE: limit entry at technical level ──
+    let consEntry, consTp1, consTp2, consSl, consMethod;
+    const oteLevel = direction === "LONG" ? hi24 - atr * 0.618 : lo24 + atr * 0.618;
+    const eqLevel = (hi24 + lo24) / 2;
+    const obLevel = direction === "LONG" ? lo24 + atr * 0.236 : hi24 - atr * 0.236;
+
+    if (direction === "LONG") {
+      const candidates = [
+        { p: oteLevel, m: "OTE Zone (0.618 Fib)" },
+        { p: eqLevel, m: "Equilibrium (50%)" },
+        { p: obLevel, m: "Demand Zone / OB" }
+      ].filter(c => c.p < price && c.p > lo24 * 0.95);
+      candidates.sort((a, b) => b.p - a.p);
+      const pick = candidates[0] || { p: price * 0.97, m: "Limit -3%" };
+      consEntry = pick.p;
+      consMethod = pick.m;
+      const cR1 = Math.max(atrPct * 0.8, 2);
+      const cR2 = Math.max(atrPct * 1.6, 5);
+      const cSlP = Math.max(atrPct * 0.4, 1.2);
+      consTp1 = consEntry * (1 + cR1 / 100);
+      consTp2 = consEntry * (1 + cR2 / 100);
+      consSl = consEntry * (1 - cSlP / 100);
+    } else {
+      const candidates = [
+        { p: oteLevel, m: "OTE Zone (0.618 Fib)" },
+        { p: eqLevel, m: "Equilibrium (50%)" },
+        { p: obLevel, m: "Supply Zone / OB" }
+      ].filter(c => c.p > price && c.p < hi24 * 1.05);
+      candidates.sort((a, b) => a.p - b.p);
+      const pick = candidates[0] || { p: price * 1.03, m: "Limit +3%" };
+      consEntry = pick.p;
+      consMethod = pick.m;
+      const cR1 = Math.max(atrPct * 0.8, 2);
+      const cR2 = Math.max(atrPct * 1.6, 5);
+      const cSlP = Math.max(atrPct * 0.4, 1.2);
+      consTp1 = consEntry * (1 - cR1 / 100);
+      consTp2 = consEntry * (1 - cR2 / 100);
+      consSl = consEntry * (1 + cSlP / 100);
+    }
+    const consRisk = Math.abs(consEntry - consSl);
+    const consReward = Math.abs(consTp2 - consEntry);
+    const consRr = consRisk > 0 ? (consReward / consRisk).toFixed(1) : "--";
+    const consTp1Pct = ((consTp1 - consEntry) / consEntry * 100);
+    const consTp2Pct = ((consTp2 - consEntry) / consEntry * 100);
+    const consSlPct = ((consSl - consEntry) / consEntry * 100);
 
     tradingSignals.push({
       coin: c, scores: s, direction, confidence,
-      entry, tp1, tp2, sl, rr,
-      tp1Pct, tp2Pct, slPct,
+      entry, tp1, tp2, sl, rr, tp1Pct, tp2Pct, slPct,
+      consEntry, consTp1, consTp2, consSl, consRr,
+      consTp1Pct, consTp2Pct, consSlPct, consMethod,
       reasons, tags: [...new Set(tags)], timeframe
     });
   });
@@ -1073,13 +1194,15 @@ function renderSignals() {
   if (filter === "long") signals = signals.filter(s => s.direction === "LONG");
   else if (filter === "short") signals = signals.filter(s => s.direction === "SHORT");
   else if (filter === "high") signals = signals.filter(s => s.confidence >= 75);
+  else if (filter === "tracked") signals = signals.filter(s => trackedSignals[s.coin.id]);
 
   const top = signals.slice(0, 18);
   const longCount = tradingSignals.filter(s => s.direction === "LONG").length;
   const shortCount = tradingSignals.filter(s => s.direction === "SHORT").length;
+  const trackedCount = Object.values(trackedSignals).filter(t => t.status === "active").length;
 
   document.getElementById("signalCountBadge").textContent =
-    `${tradingSignals.length} SIGNALS · ${longCount}L / ${shortCount}S`;
+    `${tradingSignals.length} SIGNALS · ${longCount}L / ${shortCount}S${trackedCount ? ` · ${trackedCount} TRACKED` : ""}`;
 
   if (!top.length) {
     grid.innerHTML = `<div class="signal-empty">No ${filter === "all" ? "" : filter.toUpperCase() + " "}signals detected in this cycle. Signals require strong multi-factor alignment.</div>`;
@@ -1092,14 +1215,104 @@ function renderSignals() {
     const dirTagCls = sig.direction === "LONG" ? "dir-long" : "dir-short";
     const arrow = sig.direction === "LONG" ? "↑" : "↓";
     const confCls = sig.confidence >= 75 ? "conf-high" : sig.confidence >= 55 ? "conf-mid" : "conf-low";
-
     const tp1Cls = sig.direction === "LONG" ? "score-high" : "score-low";
     const tp2Cls = sig.direction === "LONG" ? "score-high" : "score-low";
     const slCls = sig.direction === "LONG" ? "score-low" : "score-high";
-
     const reasonText = sig.reasons.slice(0, 3).map(r => `<strong>•</strong> ${r}`).join("<br>");
 
-    return `<div class="signal-card ${dirCls} animate-in" data-coin-id="${c.id}">
+    const tracked = trackedSignals[c.id];
+    const isTracked = tracked && tracked.status === "active";
+    const isDone = tracked && (tracked.status === "sl" || tracked.status === "tpmax" || tracked.status === "closed");
+
+    function levelsHTML(e, t1, t2, s, rr, t1p, t2p, sp) {
+      return `<div class="signal-levels">
+        <div class="signal-level">
+          <div class="signal-level-label">Entry</div>
+          <div class="signal-level-value">${fmtPrice(e)}</div>
+        </div>
+        <div class="signal-level">
+          <div class="signal-level-label">Target 1</div>
+          <div class="signal-level-value ${tp1Cls}">${fmtPrice(t1)}</div>
+          <div class="signal-level-pct">${t1p >= 0 ? "+" : ""}${t1p.toFixed(1)}%</div>
+        </div>
+        <div class="signal-level">
+          <div class="signal-level-label">Target 2</div>
+          <div class="signal-level-value ${tp2Cls}">${fmtPrice(t2)}</div>
+          <div class="signal-level-pct">${t2p >= 0 ? "+" : ""}${t2p.toFixed(1)}%</div>
+        </div>
+        <div class="signal-level">
+          <div class="signal-level-label">Stop Loss</div>
+          <div class="signal-level-value ${slCls}">${fmtPrice(s)}</div>
+          <div class="signal-level-pct">${sp >= 0 ? "+" : ""}${sp.toFixed(1)}%</div>
+        </div>
+      </div>
+      <div class="signal-rr">
+        <div class="signal-rr-item"><span class="signal-rr-label">R:R</span><span class="signal-rr-value" style="color:var(--accent)">${rr}x</span></div>
+        <div class="signal-rr-item"><span class="signal-rr-label">Whale</span><span class="signal-rr-value score-${scoreColor(sig.scores.whale)}">${sig.scores.whale}</span></div>
+        <div class="signal-rr-item"><span class="signal-rr-label">Smart $</span><span class="signal-rr-value score-${scoreColor(sig.scores.smart)}">${sig.scores.smart}</span></div>
+        <div class="signal-rr-item"><span class="signal-rr-label">Pump</span><span class="signal-rr-value score-${scoreColor(sig.scores.pump)}">${sig.scores.pump}%</span></div>
+      </div>`;
+    }
+
+    let trackingHTML = "";
+    if (isTracked) {
+      const curPrice = c.current_price;
+      const pnl = tracked.direction === "LONG"
+        ? ((curPrice - tracked.entryPrice) / tracked.entryPrice) * 100
+        : ((tracked.entryPrice - curPrice) / tracked.entryPrice) * 100;
+      const pnlCls = pnl >= 0 ? "tracking-profit" : "tracking-loss";
+      const range = Math.abs(tracked.tp2 - tracked.sl);
+      let progress = 0;
+      if (range > 0) {
+        progress = tracked.direction === "LONG"
+          ? ((curPrice - tracked.sl) / range) * 100
+          : ((tracked.sl - curPrice) / range) * 100;
+      }
+      progress = Math.max(0, Math.min(100, progress));
+      const slPos = 0;
+      const entryPos = range > 0 ? (tracked.direction === "LONG"
+        ? ((tracked.entryPrice - tracked.sl) / range) * 100
+        : ((tracked.sl - tracked.entryPrice) / range) * 100) : 50;
+      const tp1Pos = range > 0 ? (tracked.direction === "LONG"
+        ? ((tracked.tp1 - tracked.sl) / range) * 100
+        : ((tracked.sl - tracked.tp1) / range) * 100) : 75;
+
+      const takenAgo = Math.round((Date.now() - tracked.takenAt) / 60000);
+      const agoText = takenAgo < 60 ? `${takenAgo}m ago` : `${Math.round(takenAgo / 60)}h ago`;
+
+      trackingHTML = `<div class="signal-tracking">
+        <div class="tracking-header">
+          <span class="tracking-badge ${tracked.tp1Hit ? 'tracking-tp1hit' : 'tracking-active'}">${tracked.tp1Hit ? 'TP1 HIT ✓' : 'ACTIVE'}</span>
+          <span class="tracking-type">${tracked.entryType === "aggressive" ? "Market" : "Limit"} · ${agoText}</span>
+          <span class="tracking-pnl ${pnlCls}">${pnl >= 0 ? "+" : ""}${pnl.toFixed(2)}%</span>
+        </div>
+        <div class="tracking-bar">
+          <div class="tracking-bar-bg">
+            <div class="tracking-bar-danger" style="width:${Math.max(entryPos, 0)}%"></div>
+            <div class="tracking-bar-safe" style="left:${entryPos}%;width:${100 - entryPos}%"></div>
+          </div>
+          <div class="tracking-marker tracking-marker-entry" style="left:${entryPos}%" title="Entry"></div>
+          <div class="tracking-marker tracking-marker-tp1" style="left:${tp1Pos}%" title="TP1"></div>
+          <div class="tracking-marker tracking-marker-price" style="left:${progress}%" title="Current: ${fmtPrice(curPrice)}"></div>
+          <div class="tracking-labels">
+            <span>SL</span>
+            <span style="left:${entryPos}%">Entry</span>
+            <span style="left:${tp1Pos}%">TP1</span>
+            <span style="left:100%">TP Max</span>
+          </div>
+        </div>
+        <button class="signal-close-btn" data-action="close" data-coin-id="${c.id}">Close Trade</button>
+      </div>`;
+    } else if (isDone) {
+      const label = tracked.status === "tpmax" ? "TP MAX HIT ✓✓" : tracked.status === "sl" ? "STOPPED OUT ✗" : "CLOSED";
+      const cls = tracked.status === "tpmax" ? "tracking-tpmax" : tracked.status === "sl" ? "tracking-sl" : "tracking-closed";
+      trackingHTML = `<div class="signal-tracking-done">
+        <span class="tracking-badge ${cls}">${label}</span>
+        <button class="signal-dismiss-btn" data-action="dismiss" data-coin-id="${c.id}">Dismiss</button>
+      </div>`;
+    }
+
+    return `<div class="signal-card ${dirCls}${isTracked ? ' signal-tracked' : ''}${isDone ? ' signal-done' : ''} animate-in" data-coin-id="${c.id}">
       <div class="signal-card-top">
         <div class="signal-coin-info">
           <img src="${c.image}" alt="${c.symbol}" loading="lazy">
@@ -1119,45 +1332,17 @@ function renderSignals() {
         </div>
       </div>
 
-      <div class="signal-levels">
-        <div class="signal-level">
-          <div class="signal-level-label">Entry</div>
-          <div class="signal-level-value">${fmtPrice(sig.entry)}</div>
-        </div>
-        <div class="signal-level">
-          <div class="signal-level-label">Target 1</div>
-          <div class="signal-level-value ${tp1Cls}">${fmtPrice(sig.tp1)}</div>
-          <div class="signal-level-pct">${sig.tp1Pct >= 0 ? "+" : ""}${sig.tp1Pct.toFixed(1)}%</div>
-        </div>
-        <div class="signal-level">
-          <div class="signal-level-label">Target 2</div>
-          <div class="signal-level-value ${tp2Cls}">${fmtPrice(sig.tp2)}</div>
-          <div class="signal-level-pct">${sig.tp2Pct >= 0 ? "+" : ""}${sig.tp2Pct.toFixed(1)}%</div>
-        </div>
-        <div class="signal-level">
-          <div class="signal-level-label">Stop Loss</div>
-          <div class="signal-level-value ${slCls}">${fmtPrice(sig.sl)}</div>
-          <div class="signal-level-pct">${sig.slPct >= 0 ? "+" : ""}${sig.slPct.toFixed(1)}%</div>
-        </div>
+      <div class="signal-entry-tabs">
+        <button class="entry-tab active" data-tab="aggressive" data-coin-id="${c.id}">Aggressive (Market)</button>
+        <button class="entry-tab" data-tab="conservative" data-coin-id="${c.id}">Conservative (Limit)</button>
       </div>
 
-      <div class="signal-rr">
-        <div class="signal-rr-item">
-          <span class="signal-rr-label">R:R Ratio</span>
-          <span class="signal-rr-value" style="color:var(--accent)">${sig.rr}x</span>
-        </div>
-        <div class="signal-rr-item">
-          <span class="signal-rr-label">Whale</span>
-          <span class="signal-rr-value score-${scoreColor(sig.scores.whale)}">${sig.scores.whale}</span>
-        </div>
-        <div class="signal-rr-item">
-          <span class="signal-rr-label">Smart $</span>
-          <span class="signal-rr-value score-${scoreColor(sig.scores.smart)}">${sig.scores.smart}</span>
-        </div>
-        <div class="signal-rr-item">
-          <span class="signal-rr-label">Pump</span>
-          <span class="signal-rr-value score-${scoreColor(sig.scores.pump)}">${sig.scores.pump}%</span>
-        </div>
+      <div class="entry-panel entry-aggressive" data-panel="aggressive">
+        ${levelsHTML(sig.entry, sig.tp1, sig.tp2, sig.sl, sig.rr, sig.tp1Pct, sig.tp2Pct, sig.slPct)}
+      </div>
+      <div class="entry-panel entry-conservative" data-panel="conservative" style="display:none">
+        <div class="cons-method"><span class="cons-method-icon">◎</span> ${sig.consMethod}</div>
+        ${levelsHTML(sig.consEntry, sig.consTp1, sig.consTp2, sig.consSl, sig.consRr, sig.consTp1Pct, sig.consTp2Pct, sig.consSlPct)}
       </div>
 
       <div class="signal-reason">${reasonText}</div>
@@ -1167,6 +1352,11 @@ function renderSignals() {
         <span class="signal-tag">${sig.scores.pressure}</span>
         <span class="signal-tag">${sig.scores.risk} Risk</span>
       </div>
+
+      ${trackingHTML || `<div class="signal-actions">
+        <button class="signal-take-btn" data-action="take" data-coin-id="${c.id}">✓ Take Signal</button>
+        <button class="signal-skip-btn" data-action="skip" data-coin-id="${c.id}">✗ Skip</button>
+      </div>`}
     </div>`;
   }).join("");
 }
@@ -1496,6 +1686,7 @@ async function refreshAll() {
 
   generateWalletTxs();
   generateSignals();
+  updateTrackedSignals();
 
   renderGlobalStats(cachedGlobal, cachedFng);
   renderTicker(allCoins);
@@ -1522,8 +1713,44 @@ function setupListeners() {
 
   document.getElementById("signalFilter").addEventListener("change", () => { renderSignals(); });
   document.getElementById("signalGrid").addEventListener("click", (e) => {
+    // Entry type tabs
+    const tab = e.target.closest(".entry-tab[data-tab]");
+    if (tab) {
+      const card = tab.closest(".signal-card");
+      if (!card) return;
+      card.querySelectorAll(".entry-tab").forEach(t => t.classList.remove("active"));
+      tab.classList.add("active");
+      card.querySelectorAll(".entry-panel").forEach(p => p.style.display = "none");
+      const panel = card.querySelector(`.entry-panel[data-panel="${tab.dataset.tab}"]`);
+      if (panel) panel.style.display = "";
+      return;
+    }
+    // Take signal
+    const takeBtn = e.target.closest("[data-action='take']");
+    if (takeBtn) {
+      const coinId = takeBtn.dataset.coinId;
+      const card = takeBtn.closest(".signal-card");
+      const activeTab = card?.querySelector(".entry-tab.active");
+      const entryType = activeTab?.dataset.tab || "aggressive";
+      takeSignal(coinId, entryType);
+      return;
+    }
+    // Skip signal
+    const skipBtn = e.target.closest("[data-action='skip']");
+    if (skipBtn) {
+      const card = skipBtn.closest(".signal-card");
+      if (card) card.style.display = "none";
+      return;
+    }
+    // Close tracked trade
+    const closeBtn = e.target.closest("[data-action='close']");
+    if (closeBtn) { closeTrackedSignal(closeBtn.dataset.coinId); return; }
+    // Dismiss completed trade
+    const dismissBtn = e.target.closest("[data-action='dismiss']");
+    if (dismissBtn) { removeTrackedSignal(dismissBtn.dataset.coinId); return; }
+    // Open modal on card click (but not on buttons)
     const card = e.target.closest(".signal-card[data-coin-id]");
-    if (card) openModal(card.dataset.coinId);
+    if (card && !e.target.closest("button")) openModal(card.dataset.coinId);
   });
 
   document.getElementById("accumulationList").addEventListener("click", (e) => {
@@ -1638,6 +1865,7 @@ function startCountdown() {
   document.getElementById("derivGrid").innerHTML =
     Array(6).fill(`<div class="deriv-card"><div class="skeleton" style="width:100%;height:150px"></div></div>`).join("");
 
+  loadTrackedSignals();
   setupListeners();
   setupSectionNav();
 
