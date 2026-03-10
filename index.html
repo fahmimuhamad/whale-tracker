@@ -49,10 +49,26 @@
         <span class="stat-change" id="fearGreedLabel">--</span>
       </div>
       <div class="stat-card">
-        <span class="stat-label">Coins w/ Signals</span>
+        <span class="stat-label">BTC Funding</span>
+        <span class="stat-value" id="btcFunding">--</span>
+        <span class="stat-change" id="btcFundingLabel">--</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Active Signals</span>
         <span class="stat-value" id="activeSignals">--</span>
+        <span class="stat-change" id="signalBreakdown">--</span>
       </div>
     </section>
+
+    <nav class="section-nav" id="sectionNav">
+      <a href="#assetPanel" class="nav-pill active" data-section="assetPanel">Assets</a>
+      <a href="#signalPanel" class="nav-pill" data-section="signalPanel">Signals</a>
+      <a href="#walletPanel" class="nav-pill" data-section="walletPanel">Wallet Feed</a>
+      <a href="#rankedPanel" class="nav-pill" data-section="rankedPanel">Top Lists</a>
+      <a href="#derivativesPanel" class="nav-pill" data-section="derivativesPanel">Derivatives</a>
+      <a href="#anomalyPanel" class="nav-pill" data-section="anomalyPanel">Anomalies</a>
+      <a href="#insightPanel" class="nav-pill" data-section="insightPanel">Insights</a>
+    </nav>
 
     <main class="dashboard">
 
@@ -114,8 +130,47 @@
         <div class="pagination" id="pagination"></div>
       </section>
 
+      <!-- High Probability Trading Signals -->
+      <section class="panel signal-panel" id="signalPanel">
+        <div class="panel-header">
+          <div>
+            <h2>High Probability Trading Signals</h2>
+            <p class="panel-subtitle">Algorithmically generated LONG and SHORT signals based on whale activity, smart money flow, accumulation patterns, volume anomalies, momentum, and ATH distance. Confidence level reflects how many scoring factors align. Always use proper risk management.</p>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="panel-badge yellow" id="signalCountBadge">--</span>
+            <select id="signalFilter" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text-secondary);font-size:0.75rem;font-family:inherit;cursor:pointer;outline:none">
+              <option value="all">All Signals</option>
+              <option value="long">LONG Only</option>
+              <option value="short">SHORT Only</option>
+              <option value="high">High Confidence (≥75%)</option>
+            </select>
+          </div>
+        </div>
+        <div class="signal-grid" id="signalGrid"></div>
+      </section>
+
+      <!-- Derivatives & Funding Analysis -->
+      <section class="panel derivatives-panel" id="derivativesPanel">
+        <div class="panel-header">
+          <div>
+            <h2>Derivatives & Funding Analysis</h2>
+            <p class="panel-subtitle">Live funding rates and order book pressure from Binance Futures. Extreme positive funding = overleveraged longs (squeeze risk). Negative funding = shorts paying longs (bullish). Book pressure shows bid vs ask imbalance at the top of the order book.</p>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="panel-badge orange" id="derivBadge">BINANCE LIVE</span>
+            <select id="derivSort" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text-secondary);font-size:0.75rem;font-family:inherit;cursor:pointer;outline:none">
+              <option value="funding">Sort: Funding Rate</option>
+              <option value="book">Sort: Book Pressure</option>
+              <option value="whale">Sort: Whale Score</option>
+            </select>
+          </div>
+        </div>
+        <div class="deriv-grid" id="derivGrid"></div>
+      </section>
+
       <!-- Whale Wallet Activity Feed -->
-      <section class="panel wallet-panel">
+      <section class="panel wallet-panel" id="walletPanel">
         <div class="panel-header">
           <div>
             <h2>Whale Wallet Activity</h2>
@@ -147,7 +202,7 @@
         </div>
       </section>
 
-      <div class="two-col">
+      <div class="two-col" id="rankedPanel">
         <section class="panel">
           <div class="panel-header">
             <h2>Top Accumulation Coins</h2>
@@ -165,26 +220,26 @@
       </div>
 
       <!-- Volume Anomalies -->
-      <section class="panel">
+      <section class="panel anomaly-panel" id="anomalyPanel">
         <div class="panel-header">
-          <h2>Volume Anomaly Detection</h2>
-          <span class="panel-badge red">SPIKES</span>
+          <div>
+            <h2>Volume Anomaly Detection</h2>
+            <p class="panel-subtitle">Assets with abnormally high 24h volume relative to market cap. Extreme spikes often precede major price moves — either breakouts or dumps. The intensity bar shows how far above the normal threshold (10%) the vol/mcap ratio is.</p>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px">
+            <span class="panel-badge red" id="anomalyCountBadge">--</span>
+            <select id="anomalySort" style="background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px;padding:4px 8px;color:var(--text-secondary);font-size:0.75rem;font-family:inherit;cursor:pointer;outline:none">
+              <option value="ratio">Sort: Vol/MCap</option>
+              <option value="whale">Sort: Whale Score</option>
+              <option value="change">Sort: 24h Change</option>
+            </select>
+          </div>
         </div>
-        <div class="table-wrap">
-          <table class="data-table" id="volumeTable">
-            <thead>
-              <tr>
-                <th>Asset</th><th>Price</th><th>24h Change</th>
-                <th>Vol / MCap Ratio</th><th>Anomaly Level</th><th>Whale Score</th><th>Signal</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
+        <div class="anomaly-grid" id="anomalyGrid"></div>
       </section>
 
       <!-- Dynamic Market Insights -->
-      <section class="panel insight-panel">
+      <section class="panel insight-panel" id="insightPanel">
         <div class="panel-header">
           <h2>Live Market Insights</h2>
           <span class="panel-badge purple">AUTO-GENERATED</span>
@@ -195,8 +250,8 @@
     </main>
 
     <footer>
-      <p>All scores computed algorithmically from live CoinGecko data. Volume, price action, market cap, ATH distance, and supply metrics drive every score. Not financial advice.</p>
-      <p>Auto-refreshes every 90 seconds. Next refresh: <span id="countdown">90</span>s</p>
+      <p>All scores computed algorithmically from live CoinGecko data. Trading signals, whale activity, and anomaly detection are derived from volume, price action, market cap, ATH distance, and supply metrics. <strong>Not financial advice — always DYOR.</strong></p>
+      <p>Auto-refreshes every 120 seconds. Next refresh: <span id="countdown">120</span>s · Data by <a href="https://www.coingecko.com" target="_blank" rel="noopener" style="color:var(--accent);text-decoration:none">CoinGecko</a></p>
     </footer>
 
   </div>

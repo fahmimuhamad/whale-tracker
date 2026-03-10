@@ -1,12 +1,18 @@
 // ─── Whale Intelligence — Fully Dynamic Engine ───
 // Zero hardcoded scores. All computed from live CoinGecko market data.
 
-const API_PRIMARY = "https://api.coingecko.com/api/v3";
-const API_DEMO = "https://api.coingecko.com/api/v3";
-let API = API_PRIMARY;
+const API = "https://api.coingecko.com/api/v3";
 const PER_PAGE = 250;
 let PAGES_TO_FETCH = 1;
 const CARDS_PER_PAGE = 24;
+
+// Optional: paste your free CoinGecko demo API key here for higher rate limits.
+// Get one at https://www.coingecko.com/en/api/pricing (free sign-up).
+const CG_DEMO_KEY = "";
+
+// ─── Binance API (free, no key required) ───
+const BINANCE_SPOT = "https://api.binance.com/api/v3";
+const BINANCE_FUTURES = "https://fapi.binance.com/fapi/v1";
 
 // ─── State ───
 let allCoins = [];
@@ -14,10 +20,13 @@ let scoredCoins = [];
 let previousPrices = {};
 let currentPage = 1;
 let currentView = "grid";
-let countdown = 90;
+let countdown = 120;
 let refreshTimer = null;
 let countdownTimer = null;
 let historicalVolumes = {};
+let cachedGlobal = null;
+let cachedFng = null;
+let binanceData = { tickers: {}, funding: {}, bookTickers: {} };
 
 // ─── Formatting ───
 function fmt(n) {
@@ -53,15 +62,17 @@ function setStatus(msg) {
   if (el) el.textContent = msg;
 }
 
-async function fetchWithRetry(url, retries = 5) {
+async function fetchWithRetry(url, retries = 6) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(url, {
-        headers: { "Accept": "application/json" }
-      });
+      const headers = { "Accept": "application/json" };
+      if (CG_DEMO_KEY && url.includes("coingecko.com")) {
+        headers["x-cg-demo-api-key"] = CG_DEMO_KEY;
+      }
+      const res = await fetch(url, { headers });
       if (res.ok) return await res.json();
       if (res.status === 429) {
-        const wait = Math.min(4000 * Math.pow(2, attempt), 60000);
+        const wait = Math.min(15000 * Math.pow(2, attempt), 120000);
         setStatus(`Rate limited — waiting ${(wait/1000).toFixed(0)}s (attempt ${attempt + 1}/${retries + 1})...`);
         await sleep(wait);
         continue;
@@ -72,7 +83,7 @@ async function fetchWithRetry(url, retries = 5) {
         console.warn(`Fetch failed after ${retries + 1} attempts:`, url, e.message);
         return null;
       }
-      const wait = 3000 * (attempt + 1);
+      const wait = 5000 * (attempt + 1);
       setStatus(`Connection error — retrying in ${(wait/1000).toFixed(0)}s...`);
       await sleep(wait);
     }
@@ -93,7 +104,7 @@ async function fetchAllCoins() {
     if (data && Array.isArray(data)) {
       all = all.concat(data);
     }
-    if (p < PAGES_TO_FETCH) await sleep(8000);
+    if (p < PAGES_TO_FETCH) await sleep(12000);
   }
   return all.filter(c => c && c.id && c.market_cap > 0);
 }
@@ -103,10 +114,41 @@ async function fetchGlobal() {
 }
 
 async function fetchFearGreed() {
+  return await fetchWithRetry("https://api.alternative.me/fng/?limit=1", 2);
+}
+
+// ─── Binance Data Fetching ───
+async function fetchBinance(url) {
   try {
-    const r = await fetch("https://api.alternative.me/fng/?limit=1");
-    return r.ok ? r.json() : null;
-  } catch { return null; }
+    const res = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (res.ok) return await res.json();
+    console.warn(`Binance ${res.status}:`, url);
+    return null;
+  } catch (e) {
+    console.warn("Binance fetch failed:", e.message);
+    return null;
+  }
+}
+
+async function fetchAllBinanceData() {
+  setStatus("Fetching Binance derivatives data...");
+  const [tickers, funding, bookTickers] = await Promise.all([
+    fetchBinance(`${BINANCE_SPOT}/ticker/24hr`),
+    fetchBinance(`${BINANCE_FUTURES}/premiumIndex`),
+    fetchBinance(`${BINANCE_SPOT}/ticker/bookTicker`)
+  ]);
+  if (tickers && Array.isArray(tickers)) {
+    binanceData.tickers = {};
+    tickers.forEach(t => { binanceData.tickers[t.symbol] = t; });
+  }
+  if (funding && Array.isArray(funding)) {
+    binanceData.funding = {};
+    funding.forEach(f => { binanceData.funding[f.symbol] = f; });
+  }
+  if (bookTickers && Array.isArray(bookTickers)) {
+    binanceData.bookTickers = {};
+    bookTickers.forEach(b => { binanceData.bookTickers[b.symbol] = b; });
+  }
 }
 
 // ─── DYNAMIC SCORING ENGINE ───
@@ -135,6 +177,18 @@ function computeScores(coin) {
   const volChange = prevVol ? ((vol - prevVol) / prevVol) * 100 : 0;
   historicalVolumes[coin.id] = vol;
 
+  // Binance derivatives data
+  const bnSymbol = coin.symbol.toUpperCase() + "USDT";
+  const bnFunding = binanceData.funding[bnSymbol];
+  const bnBook = binanceData.bookTickers[bnSymbol];
+  const fundingRate = bnFunding ? parseFloat(bnFunding.lastFundingRate) * 100 : null;
+  let bookPressure = 0;
+  if (bnBook) {
+    const bidQty = parseFloat(bnBook.bidQty) || 0;
+    const askQty = parseFloat(bnBook.askQty) || 0;
+    if (bidQty + askQty > 0) bookPressure = ((bidQty - askQty) / (bidQty + askQty)) * 100;
+  }
+
   // --- Whale Activity Score (0-100) ---
   // High volume/mcap = large players. Big 24h range = whale moves. High ATH distance + volume = accumulation.
   let whale = 0;
@@ -144,6 +198,8 @@ function computeScores(coin) {
   whale += clamp(Math.abs(c24) * 1.5, 0, 15);              // price movement magnitude (max 15)
   whale += clamp(volChange > 50 ? 15 : volChange * 0.2, 0, 15); // volume spike (max 15)
   if (c24 < -2 && volMcapRatio > 0.1) whale += 5;         // selling into volume = whale distribution
+  if (fundingRate !== null && Math.abs(fundingRate) > 0.03) whale += 5;
+  if (Math.abs(bookPressure) > 30) whale += 3;
   whale = clamp(whale);
 
   // --- Smart Money Score (0-100) ---
@@ -157,6 +213,8 @@ function computeScores(coin) {
   smart += clamp(supplyRatio > 0.7 ? 10 : supplyRatio * 14, 0, 10);
   if (c24 > 0 && c7d > 0 && c1h > 0) smart += 10;         // all timeframes green = conviction
   if (c24 > 1 && range24 < 5) smart += 5;                  // steady climb, not volatile
+  if (fundingRate !== null && fundingRate < -0.02 && c24 > 0) smart += 5;
+  if (fundingRate !== null && fundingRate > 0.05 && c24 < 0) smart += 5;
   smart = clamp(smart);
 
   // --- Accumulation Score (0-100) ---
@@ -180,6 +238,7 @@ function computeScores(coin) {
   pump += clamp(volChange > 100 ? 15 : volChange > 30 ? 10 : volChange > 0 ? 5 : 0, 0, 15);
   pump += clamp(range24 > 8 ? 8 : range24 * 1, 0, 8);
   pump += clamp(accum * 0.15, 0, 15);
+  if (fundingRate !== null && fundingRate < -0.03 && c24 > 0) pump += 5;
   pump = clamp(pump);
 
   // --- Pressure ---
@@ -189,6 +248,9 @@ function computeScores(coin) {
   else if (c24 < -3 && c1h < -0.5) pressure = "Bearish";
   else if (c24 < -1 && c7d < -5) pressure = "Bearish";
   else pressure = "Neutral";
+
+  if (bookPressure > 25 && c24 > 0 && pressure === "Neutral") pressure = "Bullish";
+  else if (bookPressure < -25 && c24 < 0 && pressure === "Neutral") pressure = "Bearish";
 
   // --- Risk ---
   let risk;
@@ -225,7 +287,9 @@ function computeScores(coin) {
     whale, smart, accum, pump,
     pressure, risk, signals, signalCount,
     description, volMcapRatio, athDrop, volChange, range24,
-    c24, c1h, c7d, supplyTradedPct, supplyRatio
+    c24, c1h, c7d, supplyTradedPct, supplyRatio,
+    fundingRate, bookPressure,
+    hasBinance: fundingRate !== null
   };
 }
 
@@ -277,8 +341,23 @@ function renderGlobalStats(globalData, fgData) {
     l.textContent = fg.value_classification;
     l.className = `stat-change ${parseInt(fg.value) > 50 ? "positive" : "negative"}`;
   }
-  const withSignals = scoredCoins.filter(sc => sc.scores.signalCount >= 3).length;
-  document.getElementById("activeSignals").textContent = withSignals;
+  const btcFunding = binanceData.funding["BTCUSDT"];
+  if (btcFunding) {
+    const fr = parseFloat(btcFunding.lastFundingRate) * 100;
+    document.getElementById("btcFunding").textContent = `${fr > 0 ? '+' : ''}${fr.toFixed(4)}%`;
+    const lbl = document.getElementById("btcFundingLabel");
+    lbl.textContent = fr > 0.01 ? "Longs Pay" : fr < -0.01 ? "Shorts Pay" : "Neutral";
+    lbl.className = `stat-change ${fr > 0.01 ? "negative" : fr < -0.01 ? "positive" : ""}`;
+  }
+
+  const longSigs = tradingSignals.filter(s => s.direction === "LONG").length;
+  const shortSigs = tradingSignals.filter(s => s.direction === "SHORT").length;
+  document.getElementById("activeSignals").textContent = tradingSignals.length || "--";
+  const bd = document.getElementById("signalBreakdown");
+  if (tradingSignals.length) {
+    bd.textContent = `${longSigs} LONG · ${shortSigs} SHORT`;
+    bd.className = `stat-change ${longSigs > shortSigs ? "positive" : shortSigs > longSigs ? "negative" : ""}`;
+  }
 }
 
 function renderTicker(data) {
@@ -360,6 +439,7 @@ function renderAssetGrid(filtered) {
           <div>
             <span class="pressure-tag pressure-${s.pressure.toLowerCase().includes('bull') ? 'bullish' : s.pressure.toLowerCase().includes('bear') ? 'bearish' : 'neutral'}">${s.pressure}</span>
             <span class="risk-tag risk-${s.risk.toLowerCase()}" style="margin-left:4px">${s.risk}</span>
+            ${s.fundingRate !== null ? `<span class="fr-tag ${s.fundingRate > 0.01 ? 'fr-hot' : s.fundingRate < -0.01 ? 'fr-cold' : 'fr-neutral'}" style="margin-left:4px" title="Binance Funding Rate">FR:${s.fundingRate > 0 ? '+' : ''}${s.fundingRate.toFixed(3)}%</span>` : ''}
           </div>
           <div style="text-align:right">
             <div class="pump-prob score-${scoreColor(s.pump)}">${s.pump}%</div>
@@ -443,7 +523,7 @@ function renderRankedLists() {
 }
 
 function rankedItemHTML({ coin: c, scores: s }, i, value, isPump) {
-  return `<div class="ranked-item animate-in" style="animation-delay:${i * 0.03}s">
+  return `<div class="ranked-item animate-in" data-coin-id="${c.id}" style="animation-delay:${i * 0.03}s">
     <span class="rank-num ${i < 3 ? 'top' : ''}">${i + 1}</span>
     <img class="asset-icon" src="${c.image}" alt="${c.symbol}" style="width:26px;height:26px" loading="lazy">
     <div class="ranked-info">
@@ -456,41 +536,110 @@ function rankedItemHTML({ coin: c, scores: s }, i, value, isPump) {
 }
 
 function renderVolumeAnomalies() {
-  const tbody = document.querySelector("#volumeTable tbody");
-  const anomalies = [...scoredCoins]
-    .filter(sc => sc.scores.volMcapRatio > 0.1)
-    .sort((a, b) => b.scores.volMcapRatio - a.scores.volMcapRatio)
-    .slice(0, 20);
+  const grid = document.getElementById("anomalyGrid");
+  const sortKey = document.getElementById("anomalySort")?.value || "ratio";
 
-  tbody.innerHTML = anomalies.map(({ coin: c, scores: s }) => {
-    const ratio = s.volMcapRatio;
-    let level, levelClass;
-    if (ratio > 0.5) { level = "EXTREME"; levelClass = "anomaly-extreme"; }
-    else if (ratio > 0.25) { level = "HIGH"; levelClass = "anomaly-high"; }
-    else { level = "MODERATE"; levelClass = "anomaly-moderate"; }
+  let anomalies = [...scoredCoins]
+    .filter(sc => sc.scores.volMcapRatio > 0.1);
 
-    const c24cls = s.c24 >= 0 ? "trend-up" : "trend-down";
-    const signalParts = [];
-    if (s.signals.whaleAccum) signalParts.push("Whale");
-    if (s.signals.smartMoney) signalParts.push("Smart $");
-    if (s.signals.momentum) signalParts.push("Momentum");
-    if (s.signals.deepValue) signalParts.push("Deep Value");
-    const signalStr = signalParts.length ? signalParts.join(", ") : "--";
+  const sortFns = {
+    ratio: (a, b) => b.scores.volMcapRatio - a.scores.volMcapRatio,
+    whale: (a, b) => b.scores.whale - a.scores.whale,
+    change: (a, b) => Math.abs(b.scores.c24) - Math.abs(a.scores.c24)
+  };
+  anomalies.sort(sortFns[sortKey] || sortFns.ratio);
 
-    return `<tr>
-      <td><div class="asset-cell"><img src="${c.image}" loading="lazy"><span class="asset-cell-name">${c.name}</span><span class="asset-cell-sym">${c.symbol.toUpperCase()}</span></div></td>
-      <td>${fmtPrice(c.current_price)}</td>
-      <td class="${c24cls}">${fmtPct(s.c24)}</td>
-      <td>${(ratio * 100).toFixed(1)}%</td>
-      <td class="${levelClass}">${level}</td>
-      <td class="score-${scoreColor(s.whale)}">${s.whale}</td>
-      <td>${signalStr}</td>
-    </tr>`;
-  }).join("");
+  const top = anomalies.slice(0, 20);
 
-  if (!anomalies.length) {
-    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:20px">No volume anomalies detected in this cycle</td></tr>`;
+  const extremeCount = top.filter(sc => sc.scores.volMcapRatio > 0.5).length;
+  document.getElementById("anomalyCountBadge").textContent =
+    `${top.length} SPIKES${extremeCount ? ` · ${extremeCount} EXTREME` : ""}`;
+
+  if (!top.length) {
+    grid.innerHTML = `<div class="anomaly-empty">No volume anomalies detected in this cycle. Anomalies trigger when Vol/MCap exceeds 10%.</div>`;
+    return;
   }
+
+  const maxRatio = Math.max(...top.map(sc => sc.scores.volMcapRatio), 1);
+
+  grid.innerHTML = top.map(({ coin: c, scores: s }, i) => {
+    const ratio = s.volMcapRatio;
+    const ratioPct = ratio * 100;
+
+    let level, levelKey, icon;
+    if (ratio > 0.5) {
+      level = "EXTREME"; levelKey = "extreme";
+      icon = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>`;
+    } else if (ratio > 0.25) {
+      level = "HIGH"; levelKey = "high";
+      icon = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 9v4M12 17h.01"/><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/></svg>`;
+    } else {
+      level = "MODERATE"; levelKey = "moderate";
+      icon = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>`;
+    }
+
+    const barWidth = Math.min((ratio / maxRatio) * 100, 100);
+    const thresholdPos = (0.1 / maxRatio) * 100;
+    const c24cls = s.c24 >= 0 ? "trend-up" : "trend-down";
+
+    const signalItems = [
+      { key: "whaleAccum", label: "Whale" },
+      { key: "smartMoney", label: "Smart $" },
+      { key: "momentum", label: "Momentum" },
+      { key: "volumeSpike", label: "Vol Spike" },
+      { key: "deepValue", label: "Deep Value" }
+    ];
+
+    return `<div class="anomaly-card anomaly-${levelKey} animate-in" data-coin-id="${c.id}" style="animation-delay:${i * 0.03}s">
+      <div class="anomaly-card-top">
+        <div class="anomaly-coin-info">
+          <img src="${c.image}" alt="${c.symbol}" loading="lazy">
+          <div>
+            <div class="anomaly-coin-name">${c.name}</div>
+            <div class="anomaly-coin-meta">${c.symbol.toUpperCase()} · #${c.market_cap_rank || "--"} · ${fmt(c.market_cap)}</div>
+          </div>
+        </div>
+        <div class="anomaly-level-badge alb-${levelKey}">${icon} ${level}</div>
+      </div>
+
+      <div class="anomaly-intensity">
+        <div class="anomaly-intensity-header">
+          <span class="anomaly-intensity-label">Vol / MCap Intensity</span>
+          <span class="anomaly-intensity-value anomaly-level-badge alb-${levelKey}" style="background:none;border:none;padding:0;font-size:1rem">${ratioPct.toFixed(1)}%</span>
+        </div>
+        <div class="anomaly-bar-track">
+          <div class="anomaly-bar-threshold" style="left:${thresholdPos}%"></div>
+          <div class="anomaly-bar-fill abf-${levelKey}" style="width:${barWidth}%"></div>
+        </div>
+        <div class="anomaly-bar-labels">
+          <span>0%</span>
+          <span>Normal &lt;10%</span>
+          <span>${(maxRatio * 100).toFixed(0)}%</span>
+        </div>
+      </div>
+
+      <div class="anomaly-stats">
+        <div class="anomaly-stat">
+          <div class="anomaly-stat-label">Price</div>
+          <div class="anomaly-stat-value">${fmtPrice(c.current_price)}</div>
+        </div>
+        <div class="anomaly-stat">
+          <div class="anomaly-stat-label">24h</div>
+          <div class="anomaly-stat-value ${c24cls}">${fmtPct(s.c24)}</div>
+        </div>
+        <div class="anomaly-stat">
+          <div class="anomaly-stat-label">Whale</div>
+          <div class="anomaly-stat-value score-${scoreColor(s.whale)}">${s.whale}</div>
+        </div>
+      </div>
+
+      <div class="anomaly-signals">
+        ${signalItems.map(si =>
+          `<span class="anomaly-signal-tag ${s.signals[si.key] ? 'ast-active' : 'ast-inactive'}">${s.signals[si.key] ? '✓' : '✗'} ${si.label}</span>`
+        ).join("")}
+      </div>
+    </div>`;
+  }).join("");
 }
 
 function renderInsights() {
@@ -538,6 +687,91 @@ function renderInsights() {
       <div class="insight-body">${ins.body}</div>
     </div>
   `).join("");
+}
+
+// ─── Derivatives Panel Rendering ───
+function renderDerivatives() {
+  const grid = document.getElementById("derivGrid");
+  const sortKey = document.getElementById("derivSort")?.value || "funding";
+
+  let derivCoins = scoredCoins.filter(sc => sc.scores.hasBinance);
+
+  const sortFns = {
+    funding: (a, b) => Math.abs(b.scores.fundingRate) - Math.abs(a.scores.fundingRate),
+    book: (a, b) => Math.abs(b.scores.bookPressure) - Math.abs(a.scores.bookPressure),
+    whale: (a, b) => b.scores.whale - a.scores.whale
+  };
+  derivCoins.sort(sortFns[sortKey] || sortFns.funding);
+
+  const top = derivCoins.slice(0, 24);
+
+  document.getElementById("derivBadge").textContent =
+    `${derivCoins.length} PAIRS · BINANCE`;
+
+  if (!top.length) {
+    grid.innerHTML = `<div class="deriv-empty">No Binance derivatives data available. This may be due to CORS restrictions — try running via a local server.</div>`;
+    return;
+  }
+
+  const maxFR = Math.max(...top.map(sc => Math.abs(sc.scores.fundingRate)), 0.1);
+
+  grid.innerHTML = top.map(({ coin: c, scores: s }, i) => {
+    const fr = s.fundingRate;
+    const frAbs = Math.abs(fr);
+    const frCls = fr > 0.01 ? "fr-positive" : fr < -0.01 ? "fr-negative" : "fr-neutral-card";
+    const frColor = fr > 0.01 ? "score-low" : fr < -0.01 ? "score-high" : "";
+    const frLabel = fr > 0.01 ? "Longs Pay Shorts" : fr < -0.01 ? "Shorts Pay Longs" : "Neutral";
+    const frLabelColor = fr > 0.01 ? "var(--red)" : fr < -0.01 ? "var(--green)" : "var(--text-muted)";
+
+    const barPct = Math.min((frAbs / maxFR) * 50, 50);
+    const barLeft = fr >= 0 ? 50 : 50 - barPct;
+    const barCls = fr >= 0 ? "dbf-positive" : "dbf-negative";
+
+    const bpCls = s.bookPressure > 10 ? "score-high" : s.bookPressure < -10 ? "score-low" : "";
+    const bpLabel = s.bookPressure > 15 ? "Buy Pressure" : s.bookPressure < -15 ? "Sell Pressure" : "Balanced";
+
+    const c24cls = s.c24 >= 0 ? "trend-up" : "trend-down";
+
+    return `<div class="deriv-card ${frCls} animate-in" data-coin-id="${c.id}" style="animation-delay:${i * 0.02}s">
+      <div class="deriv-card-top">
+        <div class="deriv-coin-info">
+          <img src="${c.image}" alt="${c.symbol}" loading="lazy">
+          <div>
+            <div class="deriv-coin-name">${c.name}</div>
+            <div class="deriv-coin-meta">${c.symbol.toUpperCase()}USDT · #${c.market_cap_rank || "--"}</div>
+          </div>
+        </div>
+        <div class="deriv-fr-display">
+          <div class="deriv-fr-value ${frColor}">${fr > 0 ? '+' : ''}${fr.toFixed(4)}%</div>
+          <div class="deriv-fr-label" style="color:${frLabelColor}">${frLabel}</div>
+        </div>
+      </div>
+
+      <div class="deriv-bar-track">
+        <div class="deriv-bar-center"></div>
+        <div class="deriv-bar-fill ${barCls}" style="left:${barLeft}%;width:${barPct}%"></div>
+      </div>
+
+      <div class="deriv-stats">
+        <div class="deriv-stat">
+          <div class="deriv-stat-label">24h Change</div>
+          <div class="deriv-stat-value ${c24cls}">${fmtPct(s.c24)}</div>
+        </div>
+        <div class="deriv-stat">
+          <div class="deriv-stat-label">Book Pressure</div>
+          <div class="deriv-stat-value ${bpCls}">${s.bookPressure > 0 ? '+' : ''}${s.bookPressure.toFixed(1)}%</div>
+        </div>
+        <div class="deriv-stat">
+          <div class="deriv-stat-label">Whale Score</div>
+          <div class="deriv-stat-value score-${scoreColor(s.whale)}">${s.whale}</div>
+        </div>
+        <div class="deriv-stat">
+          <div class="deriv-stat-label">Pressure</div>
+          <div class="deriv-stat-value">${bpLabel}</div>
+        </div>
+      </div>
+    </div>`;
+  }).join("");
 }
 
 // ─── Whale Wallet Activity Engine ───
@@ -702,6 +936,239 @@ function renderWalletFeed() {
 
   document.getElementById("walletFeedCount").textContent =
     `Showing ${visible.length} of ${txs.length} transactions`;
+}
+
+// ─── Trading Signal Engine ───
+let tradingSignals = [];
+
+function generateSignals() {
+  tradingSignals = [];
+  if (!scoredCoins.length) return;
+
+  scoredCoins.forEach(({ coin: c, scores: s }) => {
+    const price = c.current_price || 0;
+    const hi24 = c.high_24h || price;
+    const lo24 = c.low_24h || price;
+    if (price <= 0) return;
+
+    let direction = null;
+    let confidence = 0;
+    const reasons = [];
+    const tags = [];
+
+    // ── LONG signal conditions ──
+    let longScore = 0;
+
+    if (s.pump >= 55) { longScore += 15; reasons.push(`Pump probability ${s.pump}%`); }
+    if (s.pump >= 70) longScore += 10;
+
+    if (s.accum >= 55) { longScore += 12; reasons.push(`Accumulation score ${s.accum}/100`); }
+    if (s.accum >= 70) longScore += 8;
+
+    if (s.smart >= 50) { longScore += 10; tags.push("Smart Money"); }
+    if (s.smart >= 65) longScore += 8;
+
+    if (s.whale >= 55 && s.c24 >= 0) { longScore += 10; tags.push("Whale Buying"); }
+
+    if (s.signals.momentum) { longScore += 8; reasons.push(`Momentum: 1h ${fmtPct(s.c1h)}, 24h ${fmtPct(s.c24)}`); }
+
+    if (s.signals.volumeSpike && s.c24 > 0) { longScore += 10; tags.push("Volume Spike"); }
+
+    if (s.signals.deepValue && s.c24 >= -2) { longScore += 8; reasons.push(`${s.athDrop.toFixed(0)}% below ATH — deep value zone`); tags.push("Deep Value"); }
+
+    if (s.c24 > 0 && s.c7d > 0 && s.c1h > 0) { longScore += 8; tags.push("All Green"); }
+
+    if (s.pressure === "Bullish") { longScore += 6; }
+
+    if (s.supplyTradedPct > 3 && s.c24 > 0) { longScore += 5; tags.push("High Turnover"); }
+
+    if (s.fundingRate !== null && s.fundingRate < -0.03) { longScore += 8; reasons.push(`Negative funding ${s.fundingRate.toFixed(4)}% — short squeeze potential`); tags.push("Neg Funding"); }
+    if (s.bookPressure > 30) { longScore += 5; tags.push("Buy Wall"); }
+
+    // ── SHORT signal conditions ──
+    let shortScore = 0;
+
+    if (s.pressure === "Bearish") { shortScore += 12; }
+
+    if (s.c24 < -3 && s.c1h < -0.5) { shortScore += 15; reasons.push(`Falling hard: 1h ${fmtPct(s.c1h)}, 24h ${fmtPct(s.c24)}`); }
+
+    if (s.whale >= 55 && s.c24 < -2) { shortScore += 12; tags.push("Whale Selling"); reasons.push(`Whale distribution score ${s.whale}/100`); }
+
+    if (s.athDrop < 15 && s.volMcapRatio > 0.12) { shortScore += 14; reasons.push("Near ATH with extreme volume — potential blow-off top"); tags.push("Overbought"); }
+
+    if (s.c24 < 0 && s.c7d < 0 && s.c1h < 0) { shortScore += 10; tags.push("All Red"); }
+
+    if (s.signals.volumeSpike && s.c24 < -2) { shortScore += 10; tags.push("Sell Volume"); }
+
+    if (s.range24 > 10 && s.c24 < -3) { shortScore += 8; reasons.push(`High volatility ${s.range24.toFixed(1)}% range with downside`); }
+
+    if (s.c24 < -5 && s.volMcapRatio > 0.1) { shortScore += 8; tags.push("Breakdown"); }
+
+    if (s.supplyTradedPct > 5 && s.c24 < -1) { shortScore += 5; tags.push("Dump Volume"); }
+
+    if (s.fundingRate !== null && s.fundingRate > 0.05) { shortScore += 8; reasons.push(`High funding ${s.fundingRate.toFixed(4)}% — overleveraged longs`); tags.push("High Funding"); }
+    if (s.bookPressure < -30) { shortScore += 5; tags.push("Sell Wall"); }
+
+    // Determine direction — require meaningful threshold
+    const threshold = 40;
+    if (longScore >= threshold && longScore > shortScore + 10) {
+      direction = "LONG";
+      confidence = Math.min(95, Math.round(longScore * 0.9));
+    } else if (shortScore >= threshold && shortScore > longScore + 10) {
+      direction = "SHORT";
+      confidence = Math.min(95, Math.round(shortScore * 0.9));
+    }
+
+    if (!direction) return;
+
+    // ── Compute entry, targets, stop loss ──
+    let entry, tp1, tp2, sl;
+    const atr = hi24 - lo24;
+    const atrPct = atr / price * 100;
+
+    if (direction === "LONG") {
+      entry = price;
+      const r1 = Math.max(atrPct * 0.8, 2);
+      const r2 = Math.max(atrPct * 1.6, 5);
+      const slPct = Math.max(atrPct * 0.5, 1.5);
+      tp1 = price * (1 + r1 / 100);
+      tp2 = price * (1 + r2 / 100);
+      sl = price * (1 - slPct / 100);
+    } else {
+      entry = price;
+      const r1 = Math.max(atrPct * 0.8, 2);
+      const r2 = Math.max(atrPct * 1.6, 5);
+      const slPct = Math.max(atrPct * 0.5, 1.5);
+      tp1 = price * (1 - r1 / 100);
+      tp2 = price * (1 - r2 / 100);
+      sl = price * (1 + slPct / 100);
+    }
+
+    const risk = Math.abs(entry - sl);
+    const reward = Math.abs(tp2 - entry);
+    const rr = risk > 0 ? (reward / risk).toFixed(1) : "--";
+
+    const tp1Pct = ((tp1 - entry) / entry * 100);
+    const tp2Pct = ((tp2 - entry) / entry * 100);
+    const slPct = ((sl - entry) / entry * 100);
+
+    const timeframe = atrPct > 8 ? "Scalp / Intraday" : atrPct > 4 ? "Swing (1-3d)" : "Swing (3-7d)";
+
+    tradingSignals.push({
+      coin: c, scores: s, direction, confidence,
+      entry, tp1, tp2, sl, rr,
+      tp1Pct, tp2Pct, slPct,
+      reasons, tags: [...new Set(tags)], timeframe
+    });
+  });
+
+  tradingSignals.sort((a, b) => b.confidence - a.confidence);
+}
+
+function renderSignals() {
+  const grid = document.getElementById("signalGrid");
+  const filter = document.getElementById("signalFilter")?.value || "all";
+
+  let signals = tradingSignals;
+  if (filter === "long") signals = signals.filter(s => s.direction === "LONG");
+  else if (filter === "short") signals = signals.filter(s => s.direction === "SHORT");
+  else if (filter === "high") signals = signals.filter(s => s.confidence >= 75);
+
+  const top = signals.slice(0, 18);
+  const longCount = tradingSignals.filter(s => s.direction === "LONG").length;
+  const shortCount = tradingSignals.filter(s => s.direction === "SHORT").length;
+
+  document.getElementById("signalCountBadge").textContent =
+    `${tradingSignals.length} SIGNALS · ${longCount}L / ${shortCount}S`;
+
+  if (!top.length) {
+    grid.innerHTML = `<div class="signal-empty">No ${filter === "all" ? "" : filter.toUpperCase() + " "}signals detected in this cycle. Signals require strong multi-factor alignment.</div>`;
+    return;
+  }
+
+  grid.innerHTML = top.map(sig => {
+    const c = sig.coin;
+    const dirCls = sig.direction === "LONG" ? "signal-long" : "signal-short";
+    const dirTagCls = sig.direction === "LONG" ? "dir-long" : "dir-short";
+    const arrow = sig.direction === "LONG" ? "↑" : "↓";
+    const confCls = sig.confidence >= 75 ? "conf-high" : sig.confidence >= 55 ? "conf-mid" : "conf-low";
+
+    const tp1Cls = sig.direction === "LONG" ? "score-high" : "score-low";
+    const tp2Cls = sig.direction === "LONG" ? "score-high" : "score-low";
+    const slCls = sig.direction === "LONG" ? "score-low" : "score-high";
+
+    const reasonText = sig.reasons.slice(0, 3).map(r => `<strong>•</strong> ${r}`).join("<br>");
+
+    return `<div class="signal-card ${dirCls} animate-in" data-coin-id="${c.id}">
+      <div class="signal-card-top">
+        <div class="signal-coin-info">
+          <img src="${c.image}" alt="${c.symbol}" loading="lazy">
+          <div>
+            <div class="signal-coin-name">${c.name}</div>
+            <div class="signal-coin-meta">${c.symbol.toUpperCase()} · #${c.market_cap_rank || "--"} · ${sig.timeframe}</div>
+          </div>
+        </div>
+        <div class="signal-direction ${dirTagCls}">${arrow} ${sig.direction}</div>
+      </div>
+
+      <div class="signal-confidence-wrap">
+        <div class="signal-confidence-bar"><div class="signal-confidence-fill ${confCls}" style="width:${sig.confidence}%"></div></div>
+        <div class="signal-confidence-label">
+          <span>Confidence</span>
+          <span class="signal-confidence-value ${confCls}">${sig.confidence}%</span>
+        </div>
+      </div>
+
+      <div class="signal-levels">
+        <div class="signal-level">
+          <div class="signal-level-label">Entry</div>
+          <div class="signal-level-value">${fmtPrice(sig.entry)}</div>
+        </div>
+        <div class="signal-level">
+          <div class="signal-level-label">Target 1</div>
+          <div class="signal-level-value ${tp1Cls}">${fmtPrice(sig.tp1)}</div>
+          <div class="signal-level-pct">${sig.tp1Pct >= 0 ? "+" : ""}${sig.tp1Pct.toFixed(1)}%</div>
+        </div>
+        <div class="signal-level">
+          <div class="signal-level-label">Target 2</div>
+          <div class="signal-level-value ${tp2Cls}">${fmtPrice(sig.tp2)}</div>
+          <div class="signal-level-pct">${sig.tp2Pct >= 0 ? "+" : ""}${sig.tp2Pct.toFixed(1)}%</div>
+        </div>
+        <div class="signal-level">
+          <div class="signal-level-label">Stop Loss</div>
+          <div class="signal-level-value ${slCls}">${fmtPrice(sig.sl)}</div>
+          <div class="signal-level-pct">${sig.slPct >= 0 ? "+" : ""}${sig.slPct.toFixed(1)}%</div>
+        </div>
+      </div>
+
+      <div class="signal-rr">
+        <div class="signal-rr-item">
+          <span class="signal-rr-label">R:R Ratio</span>
+          <span class="signal-rr-value" style="color:var(--accent)">${sig.rr}x</span>
+        </div>
+        <div class="signal-rr-item">
+          <span class="signal-rr-label">Whale</span>
+          <span class="signal-rr-value score-${scoreColor(sig.scores.whale)}">${sig.scores.whale}</span>
+        </div>
+        <div class="signal-rr-item">
+          <span class="signal-rr-label">Smart $</span>
+          <span class="signal-rr-value score-${scoreColor(sig.scores.smart)}">${sig.scores.smart}</span>
+        </div>
+        <div class="signal-rr-item">
+          <span class="signal-rr-label">Pump</span>
+          <span class="signal-rr-value score-${scoreColor(sig.scores.pump)}">${sig.scores.pump}%</span>
+        </div>
+      </div>
+
+      <div class="signal-reason">${reasonText}</div>
+
+      <div class="signal-tags">
+        ${sig.tags.map(t => `<span class="signal-tag tag-active">${t}</span>`).join("")}
+        <span class="signal-tag">${sig.scores.pressure}</span>
+        <span class="signal-tag">${sig.scores.risk} Risk</span>
+      </div>
+    </div>`;
+  }).join("");
 }
 
 // ─── Detail Modal ───
@@ -870,6 +1337,24 @@ function openModal(coinId) {
       </div>
     </div>
 
+    ${s.hasBinance ? `<div class="modal-section">
+      <div class="modal-section-title" style="color:var(--orange)">Binance Derivatives</div>
+      <div class="modal-grid">
+        <div class="modal-stat">
+          <div class="modal-stat-label">Funding Rate</div>
+          <div class="modal-stat-value ${s.fundingRate > 0.01 ? 'score-low' : s.fundingRate < -0.01 ? 'score-high' : ''}">${s.fundingRate !== null ? (s.fundingRate > 0 ? '+' : '') + s.fundingRate.toFixed(4) + '%' : '--'}</div>
+        </div>
+        <div class="modal-stat">
+          <div class="modal-stat-label">Funding Bias</div>
+          <div class="modal-stat-value">${s.fundingRate > 0.01 ? 'Longs Pay Shorts' : s.fundingRate < -0.01 ? 'Shorts Pay Longs' : 'Neutral'}</div>
+        </div>
+        <div class="modal-stat">
+          <div class="modal-stat-label">Book Pressure</div>
+          <div class="modal-stat-value ${s.bookPressure > 10 ? 'score-high' : s.bookPressure < -10 ? 'score-low' : ''}">${s.bookPressure > 0 ? '+' : ''}${s.bookPressure.toFixed(1)}%</div>
+        </div>
+      </div>
+    </div>` : ''}
+
     <div class="modal-section">
       <div class="modal-section-title">Active Signals (${s.signalCount}/5)</div>
       <div class="modal-signals">
@@ -878,6 +1363,51 @@ function openModal(coinId) {
         ).join("")}
       </div>
     </div>
+
+    ${(() => {
+      const sig = tradingSignals.find(s => s.coin.id === coinId);
+      if (!sig) return '';
+      const dirCls = sig.direction === "LONG" ? "dir-long" : "dir-short";
+      const arrow = sig.direction === "LONG" ? "↑" : "↓";
+      const confCls = sig.confidence >= 75 ? "conf-high" : sig.confidence >= 55 ? "conf-mid" : "conf-low";
+      const tp1Cls = sig.direction === "LONG" ? "score-high" : "score-low";
+      const tp2Cls = sig.direction === "LONG" ? "score-high" : "score-low";
+      const slCls = sig.direction === "LONG" ? "score-low" : "score-high";
+      return `<div class="modal-section">
+        <div class="modal-section-title" style="color:${sig.direction === 'LONG' ? 'var(--green)' : 'var(--red)'}">Active Trading Signal</div>
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+          <span class="signal-direction ${dirCls}" style="font-size:0.9rem;padding:8px 20px">${arrow} ${sig.direction}</span>
+          <span class="signal-confidence-value ${confCls}" style="font-size:1.1rem">${sig.confidence}% confidence</span>
+          <span style="font-size:0.75rem;color:var(--text-muted)">${sig.timeframe}</span>
+        </div>
+        <div class="modal-grid" style="margin-bottom:10px">
+          <div class="modal-stat">
+            <div class="modal-stat-label">Entry</div>
+            <div class="modal-stat-value">${fmtPrice(sig.entry)}</div>
+          </div>
+          <div class="modal-stat">
+            <div class="modal-stat-label">Target 1</div>
+            <div class="modal-stat-value ${tp1Cls}">${fmtPrice(sig.tp1)} <span style="font-size:0.7rem">(${sig.tp1Pct >= 0 ? '+' : ''}${sig.tp1Pct.toFixed(1)}%)</span></div>
+          </div>
+          <div class="modal-stat">
+            <div class="modal-stat-label">Target 2</div>
+            <div class="modal-stat-value ${tp2Cls}">${fmtPrice(sig.tp2)} <span style="font-size:0.7rem">(${sig.tp2Pct >= 0 ? '+' : ''}${sig.tp2Pct.toFixed(1)}%)</span></div>
+          </div>
+          <div class="modal-stat">
+            <div class="modal-stat-label">Stop Loss</div>
+            <div class="modal-stat-value ${slCls}">${fmtPrice(sig.sl)} <span style="font-size:0.7rem">(${sig.slPct >= 0 ? '+' : ''}${sig.slPct.toFixed(1)}%)</span></div>
+          </div>
+          <div class="modal-stat">
+            <div class="modal-stat-label">Risk:Reward</div>
+            <div class="modal-stat-value" style="color:var(--accent)">${sig.rr}x</div>
+          </div>
+          <div class="modal-stat">
+            <div class="modal-stat-label">Reasons</div>
+            <div style="font-size:0.72rem;color:var(--text-secondary);line-height:1.4">${sig.reasons.slice(0, 2).join('; ')}</div>
+          </div>
+        </div>
+      </div>`;
+    })()}
 
     ${coinTxs.length ? `<div class="modal-section">
       <div class="modal-section-title">Recent Whale Transactions</div>
@@ -923,32 +1453,40 @@ async function refreshAll() {
   const btn = document.getElementById("btnRefresh");
   btn.classList.add("spinning");
 
-  // Fetch sequentially to avoid rate limits
   setStatus("Fetching market data...");
   const coins = await fetchAllCoins();
-
-  await sleep(2000);
-  setStatus("Fetching global stats...");
-  const globalData = await fetchGlobal();
-
-  const fgData = await fetchFearGreed();
 
   if (coins && coins.length) {
     coins.forEach(c => { previousPrices[c.id] = allCoins.find(a => a.id === c.id)?.current_price; });
     allCoins = coins;
-    setStatus(`Loaded ${coins.length} coins. Scoring...`);
+    setStatus(`Loaded ${coins.length} coins. Fetching stats...`);
   } else if (!allCoins.length) {
     setStatus("API rate limited — will retry automatically...");
     document.getElementById("assetGrid").innerHTML =
       `<div style="grid-column:1/-1;text-align:center;padding:60px 20px;color:var(--text-muted)">
         <div style="font-size:1.2rem;margin-bottom:8px">Waiting for API rate limit to reset...</div>
-        <div style="font-size:0.85rem">CoinGecko free API allows ~10-30 calls/minute. The dashboard will automatically retry. You can also click the refresh button.</div>
+        <div style="font-size:0.85rem">CoinGecko free API allows ~10-30 calls/minute. The dashboard will automatically retry in 2 minutes.${
+          CG_DEMO_KEY ? "" : "<br><br>Tip: add a free CoinGecko Demo API key in app.js for better rate limits."
+        }</div>
       </div>`;
     btn.classList.remove("spinning");
-    countdown = 90;
+    countdown = 120;
     return;
+  } else {
+    setStatus("Market data rate-limited — using cached coins. Fetching stats...");
   }
 
+  await sleep(5000);
+  const globalData = await fetchGlobal();
+  if (globalData) cachedGlobal = globalData;
+
+  await sleep(4000);
+  const fgData = await fetchFearGreed();
+  if (fgData) cachedFng = fgData;
+
+  await fetchAllBinanceData();
+
+  setStatus("Scoring...");
   scoredCoins = allCoins.map(coin => ({
     coin,
     scores: computeScores(coin)
@@ -957,18 +1495,21 @@ async function refreshAll() {
   document.getElementById("coinCount").textContent = `${allCoins.length} coins`;
 
   generateWalletTxs();
+  generateSignals();
 
-  renderGlobalStats(globalData, fgData);
+  renderGlobalStats(cachedGlobal, cachedFng);
   renderTicker(allCoins);
+  renderSignals();
   renderView();
   renderRankedLists();
   renderWalletFeed();
   renderVolumeAnomalies();
+  renderDerivatives();
   renderInsights();
 
   document.getElementById("lastUpdate").textContent = `Updated ${new Date().toLocaleTimeString()}`;
   btn.classList.remove("spinning");
-  countdown = 90;
+  countdown = 120;
 }
 
 // ─── Event Listeners ───
@@ -978,6 +1519,33 @@ function setupListeners() {
   document.getElementById("searchInput").addEventListener("input", () => { currentPage = 1; renderView(); });
   document.getElementById("filterMinPump").addEventListener("change", () => { currentPage = 1; renderView(); });
   document.getElementById("filterSort").addEventListener("change", () => { currentPage = 1; renderView(); });
+
+  document.getElementById("signalFilter").addEventListener("change", () => { renderSignals(); });
+  document.getElementById("signalGrid").addEventListener("click", (e) => {
+    const card = e.target.closest(".signal-card[data-coin-id]");
+    if (card) openModal(card.dataset.coinId);
+  });
+
+  document.getElementById("accumulationList").addEventListener("click", (e) => {
+    const item = e.target.closest(".ranked-item[data-coin-id]");
+    if (item) openModal(item.dataset.coinId);
+  });
+  document.getElementById("pumpList").addEventListener("click", (e) => {
+    const item = e.target.closest(".ranked-item[data-coin-id]");
+    if (item) openModal(item.dataset.coinId);
+  });
+
+  document.getElementById("anomalySort").addEventListener("change", () => { renderVolumeAnomalies(); });
+  document.getElementById("anomalyGrid").addEventListener("click", (e) => {
+    const card = e.target.closest(".anomaly-card[data-coin-id]");
+    if (card) openModal(card.dataset.coinId);
+  });
+
+  document.getElementById("derivSort").addEventListener("change", () => { renderDerivatives(); });
+  document.getElementById("derivGrid").addEventListener("click", (e) => {
+    const card = e.target.closest(".deriv-card[data-coin-id]");
+    if (card) openModal(card.dataset.coinId);
+  });
 
   document.getElementById("walletFilter").addEventListener("change", () => { renderWalletFeed(); });
   document.getElementById("walletLoadMore").addEventListener("click", () => {
@@ -1014,12 +1582,47 @@ function setupListeners() {
   });
 }
 
+function setupSectionNav() {
+  const pills = document.querySelectorAll(".nav-pill[data-section]");
+  const sectionIds = [...pills].map(p => p.dataset.section);
+
+  pills.forEach(pill => {
+    pill.addEventListener("click", (e) => {
+      e.preventDefault();
+      const target = document.getElementById(pill.dataset.section);
+      if (target) {
+        const offset = 110;
+        const top = target.getBoundingClientRect().top + window.scrollY - offset;
+        window.scrollTo({ top, behavior: "smooth" });
+      }
+    });
+  });
+
+  let ticking = false;
+  window.addEventListener("scroll", () => {
+    if (ticking) return;
+    ticking = true;
+    requestAnimationFrame(() => {
+      const scrollY = window.scrollY + 140;
+      let activeId = sectionIds[0];
+      for (const id of sectionIds) {
+        const el = document.getElementById(id);
+        if (el && el.offsetTop <= scrollY) activeId = id;
+      }
+      pills.forEach(p => {
+        p.classList.toggle("active", p.dataset.section === activeId);
+      });
+      ticking = false;
+    });
+  });
+}
+
 function startCountdown() {
   const el = document.getElementById("countdown");
-  countdown = 90;
+  countdown = 120;
   countdownTimer = setInterval(() => {
     countdown--;
-    if (countdown <= 0) countdown = 90;
+    if (countdown <= 0) countdown = 120;
     el.textContent = countdown;
   }, 1000);
 }
@@ -1028,8 +1631,15 @@ function startCountdown() {
 (async function init() {
   document.getElementById("assetGrid").innerHTML =
     Array(CARDS_PER_PAGE).fill(`<div class="asset-card"><div class="skeleton" style="width:100%;height:200px"></div></div>`).join("");
+  document.getElementById("signalGrid").innerHTML =
+    Array(6).fill(`<div class="signal-card"><div class="skeleton" style="width:100%;height:260px"></div></div>`).join("");
+  document.getElementById("anomalyGrid").innerHTML =
+    Array(4).fill(`<div class="anomaly-card"><div class="skeleton" style="width:100%;height:180px"></div></div>`).join("");
+  document.getElementById("derivGrid").innerHTML =
+    Array(6).fill(`<div class="deriv-card"><div class="skeleton" style="width:100%;height:150px"></div></div>`).join("");
 
   setupListeners();
+  setupSectionNav();
 
   // First load: 1 page (250 coins) for fast start
   await refreshAll();
@@ -1037,7 +1647,6 @@ function startCountdown() {
   // Then expand to more pages on subsequent refreshes
   PAGES_TO_FETCH = 4;
 
-  // Refresh every 90s to avoid rate limits (free API allows ~10-30 calls/min)
-  refreshTimer = setInterval(refreshAll, 90000);
+  refreshTimer = setInterval(refreshAll, 120000);
   startCountdown();
 })();
